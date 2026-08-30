@@ -1,0 +1,3 @@
+[submodule "gphoto2"]
+	path = gphoto2
+	url = https://github.com/gphoto/gphoto2
