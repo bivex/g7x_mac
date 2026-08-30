@@ -1,5 +1,4 @@
 import Foundation
-import ImageCaptureCore
 
 // MARK: - Configuration & CLI Arguments
 
@@ -72,7 +71,7 @@ struct SyncConfig: Sendable {
           --ip <адрес>         Прямой IP камеры (например, --ip 192.168.223.242)
           --no-date            Не разбивать файлы по подпапкам с датами (YYYY-MM-DD)
           --once               Завершить работу после первой синхронизации
-          -l, --list           Только показать список обнаруженных камер и файлов
+          -l, --list           Только показать список обнаруженных файлов
           --raw                Скачивать только RAW (.CR2, .CR3, .RAW)
           --jpg, --jpeg        Скачивать только JPEG (.JPG, .JPEG)
           --delete-after       Удалять файлы с камеры после скачивания
@@ -112,152 +111,66 @@ final class SafeResult: @unchecked Sendable {
     }
 }
 
-// MARK: - Network Scanner for PTP-IP (Port 15740)
-
-final class NetworkScanner: @unchecked Sendable {
-    static func getLocalIPv4Subnets() -> [String] {
-        var subnets: [String] = []
-        var ifaddr: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&ifaddr) == 0 else { return [] }
-        defer { freeifaddrs(ifaddr) }
-
-        var ptr = ifaddr
-        while ptr != nil {
-            defer { ptr = ptr?.pointee.ifa_next }
-            let interface = ptr!.pointee
-            let addrFamily = interface.ifa_addr.pointee.sa_family
-            if addrFamily == UInt8(AF_INET) {
-                let name = String(cString: interface.ifa_name)
-                // Filter only real wifi/ethernet interfaces, exclude VM bridges
-                if (name.hasPrefix("en") || name.hasPrefix("ap")) && !name.contains("bridge") {
-                    var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                    getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
-                                &hostname, socklen_t(hostname.count),
-                                nil, 0, NI_NUMERICHOST)
-                    let ip = hostname.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
-                    if !ip.starts(with: "127.") {
-                        let parts = ip.split(separator: ".")
-                        if parts.count == 4 {
-                            let prefix = "\(parts[0]).\(parts[1]).\(parts[2])"
-                            if !subnets.contains(prefix) {
-                                subnets.append(prefix)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return subnets
-    }
-
-    static func isCameraAt(ip: String) -> Bool {
-        var sin = sockaddr_in()
-        sin.sin_family = sa_family_t(AF_INET)
-        sin.sin_port = UInt16(15740).bigEndian
-        inet_pton(AF_INET, ip, &sin.sin_addr)
-
-        let sock = socket(AF_INET, SOCK_STREAM, 0)
-        guard sock >= 0 else { return false }
-        defer { close(sock) }
-
-        var tv = timeval(tv_sec: 0, tv_usec: 200_000)
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-
-        let res = withUnsafePointer(to: &sin) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                connect(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        return res == 0
-    }
-
-    static func scanForCamera(subnets: [String]) -> String? {
-        let group = DispatchGroup()
-        let queue = DispatchQueue(label: "scanner", attributes: .concurrent)
-        let result = SafeResult()
-
-        for subnet in subnets {
-            for i in 1...254 {
-                let ip = "\(subnet).\(i)"
-                group.enter()
-                queue.async {
-                    defer { group.leave() }
-                    if isCameraAt(ip: ip) {
-                        result.set(ip)
-                    }
-                }
-            }
-        }
-        _ = group.wait(timeout: .now() + 1.5)
-        return result.get()
-    }
-}
-
-// MARK: - Main Application
+// MARK: - App
 
 final class App: @unchecked Sendable {
     private let config: SyncConfig
     private var isSyncing = false
     private var timer: Timer?
-    private var lastKnownIP: String? = "192.168.223.242"
+    private var targetIP: String = "192.168.223.242"
 
     init(config: SyncConfig) {
         self.config = config
+        if let directIP = config.manualIP {
+            self.targetIP = directIP
+        }
     }
 
     func run() {
         setbuf(stdout, nil)
         Log.info("📸 CanonSync запущен")
-        Log.info("Папка сохранения: \(config.destinationURL.path)")
+        Log.info("📁 Папка сохранения: \(config.destinationURL.path)")
+        Log.info("🎯 IP камеры: \(targetIP)")
         try? FileManager.default.createDirectory(at: config.destinationURL, withIntermediateDirectories: true)
 
-        if let directIP = config.manualIP {
-            lastKnownIP = directIP
-            Log.info("Прямое подключение к IP: \(directIP)")
-            syncWithCamera(ip: directIP)
-            if !config.watchMode { exit(0) }
-        }
-
-        Log.info("🔍 Поиск камеры в локальной сети (Wi-Fi PTP-IP)...")
-        if config.watchMode {
-            Log.info("📡 Режим ожидания активен. Включите Wi-Fi на камере.")
-            Log.info("Для выхода нажмите Ctrl+C\n")
-        }
+        Log.info("🔍 Мониторинг сети... Включите Wi-Fi на камере Canon.")
+        Log.info("Для выхода нажмите Ctrl+C\n")
 
         startPoller()
     }
 
     private func startPoller() {
-        timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             guard let self = self, !self.isSyncing else { return }
-            self.checkForCamera()
+            self.checkAndSync()
         }
-        checkForCamera()
+        checkAndSync()
     }
 
-    private func checkForCamera() {
+    private func checkAndSync() {
         guard !isSyncing else { return }
 
-        // 1. Check last known IP first
-        if let ip = lastKnownIP, NetworkScanner.isCameraAt(ip: ip) {
-            Log.camera("Камера найдена на \(ip):15740!")
-            syncWithCamera(ip: ip)
-            return
-        }
+        // Fast ping to see if camera is online without touching TCP port 15740
+        let pingProcess = Process()
+        pingProcess.executableURL = URL(fileURLWithPath: "/sbin/ping")
+        pingProcess.arguments = ["-c", "1", "-W", "300", targetIP]
+        pingProcess.standardOutput = FileHandle.nullDevice
+        pingProcess.standardError = FileHandle.nullDevice
 
-        // 2. Scan active Wi-Fi subnets
-        let subnets = NetworkScanner.getLocalIPv4Subnets()
-        if let foundIP = NetworkScanner.scanForCamera(subnets: subnets) {
-            lastKnownIP = foundIP
-            Log.camera("Найдена камера Canon по адресу: \(foundIP):15740!")
-            syncWithCamera(ip: foundIP)
+        do {
+            try pingProcess.run()
+            pingProcess.waitUntilExit()
+            if pingProcess.terminationStatus == 0 {
+                Log.camera("Камера активна в сети (\(targetIP))! Запуск передачи фото...")
+                syncWithCamera(ip: targetIP)
+            }
+        } catch {
+            // ping error, ignore
         }
     }
 
     private func syncWithCamera(ip: String) {
         isSyncing = true
-        Log.info("Открытие PTP-IP сессии с \(ip)...")
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/gphoto2")
@@ -302,13 +215,16 @@ final class App: @unchecked Sendable {
             if process.terminationStatus == 0 {
                 Log.success("Синхронизация с камерой успешно завершена!")
             } else {
-                Log.warn("Процесс завершился с кодом \(process.terminationStatus)")
+                Log.warn("Сессия завершена (код: \(process.terminationStatus))")
             }
         } catch {
-            Log.error("Не удалось запустить процесс синхронизации: \(error.localizedDescription)")
+            Log.error("Ошибка запуска: \(error.localizedDescription)")
         }
 
         print(String(repeating: "─", count: 50) + "\n")
+        
+        // Cooldown so we don't immediately re-trigger while camera is shutting down Wi-Fi
+        Thread.sleep(forTimeInterval: 3.0)
         isSyncing = false
 
         if !config.watchMode {
