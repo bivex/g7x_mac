@@ -1,6 +1,6 @@
 PREFIX ?= /usr/local
 
-.PHONY: all build release run install clean
+.PHONY: all build release run stream web-stream install clean
 
 all: build
 
@@ -12,6 +12,12 @@ release:
 
 run:
 	swift run CanonSync
+
+stream:
+	swift run CanonSync --stream
+
+web-stream:
+	./webstream.py
 
 install: release
 	mkdir -p $(PREFIX)/bin
