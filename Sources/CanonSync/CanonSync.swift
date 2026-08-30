@@ -128,7 +128,8 @@ final class NetworkScanner: @unchecked Sendable {
             let addrFamily = interface.ifa_addr.pointee.sa_family
             if addrFamily == UInt8(AF_INET) {
                 let name = String(cString: interface.ifa_name)
-                if name.hasPrefix("en") || name.hasPrefix("bridge") || name.hasPrefix("ap") {
+                // Filter only real wifi/ethernet interfaces, exclude VM bridges
+                if (name.hasPrefix("en") || name.hasPrefix("ap")) && !name.contains("bridge") {
                     var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
                     getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
                                 &hostname, socklen_t(hostname.count),
@@ -149,6 +150,28 @@ final class NetworkScanner: @unchecked Sendable {
         return subnets
     }
 
+    static func isCameraAt(ip: String) -> Bool {
+        var sin = sockaddr_in()
+        sin.sin_family = sa_family_t(AF_INET)
+        sin.sin_port = UInt16(15740).bigEndian
+        inet_pton(AF_INET, ip, &sin.sin_addr)
+
+        let sock = socket(AF_INET, SOCK_STREAM, 0)
+        guard sock >= 0 else { return false }
+        defer { close(sock) }
+
+        var tv = timeval(tv_sec: 0, tv_usec: 200_000)
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+        let res = withUnsafePointer(to: &sin) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        return res == 0
+    }
+
     static func scanForCamera(subnets: [String]) -> String? {
         let group = DispatchGroup()
         let queue = DispatchQueue(label: "scanner", attributes: .concurrent)
@@ -160,31 +183,13 @@ final class NetworkScanner: @unchecked Sendable {
                 group.enter()
                 queue.async {
                     defer { group.leave() }
-                    var sin = sockaddr_in()
-                    sin.sin_family = sa_family_t(AF_INET)
-                    sin.sin_port = UInt16(15740).bigEndian
-                    inet_pton(AF_INET, ip, &sin.sin_addr)
-
-                    let sock = socket(AF_INET, SOCK_STREAM, 0)
-                    if sock >= 0 {
-                        var tv = timeval(tv_sec: 0, tv_usec: 250_000) // 250ms
-                        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-                        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-
-                        let res = withUnsafePointer(to: &sin) {
-                            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                                connect(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-                            }
-                        }
-                        if res == 0 {
-                            result.set(ip)
-                        }
-                        close(sock)
+                    if isCameraAt(ip: ip) {
+                        result.set(ip)
                     }
                 }
             }
         }
-        _ = group.wait(timeout: .now() + 1.2)
+        _ = group.wait(timeout: .now() + 1.5)
         return result.get()
     }
 }
@@ -195,6 +200,7 @@ final class App: @unchecked Sendable {
     private let config: SyncConfig
     private var isSyncing = false
     private var timer: Timer?
+    private var lastKnownIP: String? = "192.168.223.242"
 
     init(config: SyncConfig) {
         self.config = config
@@ -207,6 +213,7 @@ final class App: @unchecked Sendable {
         try? FileManager.default.createDirectory(at: config.destinationURL, withIntermediateDirectories: true)
 
         if let directIP = config.manualIP {
+            lastKnownIP = directIP
             Log.info("Прямое подключение к IP: \(directIP)")
             syncWithCamera(ip: directIP)
             if !config.watchMode { exit(0) }
@@ -222,7 +229,7 @@ final class App: @unchecked Sendable {
     }
 
     private func startPoller() {
-        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
             guard let self = self, !self.isSyncing else { return }
             self.checkForCamera()
         }
@@ -231,8 +238,18 @@ final class App: @unchecked Sendable {
 
     private func checkForCamera() {
         guard !isSyncing else { return }
+
+        // 1. Check last known IP first
+        if let ip = lastKnownIP, NetworkScanner.isCameraAt(ip: ip) {
+            Log.camera("Камера найдена на \(ip):15740!")
+            syncWithCamera(ip: ip)
+            return
+        }
+
+        // 2. Scan active Wi-Fi subnets
         let subnets = NetworkScanner.getLocalIPv4Subnets()
         if let foundIP = NetworkScanner.scanForCamera(subnets: subnets) {
+            lastKnownIP = foundIP
             Log.camera("Найдена камера Canon по адресу: \(foundIP):15740!")
             syncWithCamera(ip: foundIP)
         }
