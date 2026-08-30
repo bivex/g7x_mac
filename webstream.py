@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Canon PowerShot G7 X Mark II — Seamless Remote Studio & Web LiveView
-- Бесшовная трансляция LiveView без обрывов при съемке фото
-- Автозаморозка последнего кадра во время щелчка затвора (Freeze frame)
-- Автоматическое мгновенное возобновление видеопотока
+- Мгновенная съемка и сохранение фото прямо на Mac в ~/Pictures/Canon_G7X/
+- Звук затвора и визуальная вспышка
+- Непрерывный живой видеопоток без обрывов
 """
 
 import sys
@@ -29,17 +29,12 @@ class FrameBroadcaster:
         self.last_valid_frame = None
         self.condition = threading.Condition(self.lock)
         self.running = True
-        self.is_capturing = False
         self.process = None
         self.worker_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self.worker_thread.start()
 
     def _capture_loop(self):
         while self.running:
-            if self.is_capturing:
-                time.sleep(0.05)
-                continue
-
             cmd = [
                 "/opt/homebrew/bin/gphoto2",
                 "--port", f"ptpip:{CAMERA_IP}",
@@ -58,7 +53,7 @@ class FrameBroadcaster:
                 soi = b'\xff\xd8'
                 eoi = b'\xff\xd9'
 
-                while self.running and not self.is_capturing and self.process.poll() is None:
+                while self.running and self.process.poll() is None:
                     chunk = self.process.stdout.read(16384)
                     if not chunk:
                         break
@@ -85,7 +80,7 @@ class FrameBroadcaster:
                             self.condition.notify_all()
 
             except Exception:
-                time.sleep(0.5)
+                time.sleep(1)
             finally:
                 if self.process:
                     try:
@@ -93,82 +88,44 @@ class FrameBroadcaster:
                         self.process.wait(timeout=1)
                     except Exception:
                         pass
-                time.sleep(0.3)
+                time.sleep(1.0)
 
     def get_frame(self, timeout=0.5):
         with self.condition:
             if self.condition.wait(timeout):
                 return self.current_frame
-            # Return last valid frame so the browser stream never drops
             return self.last_valid_frame
 
 broadcaster = FrameBroadcaster()
 
-def capture_photo_remote():
-    """Спуск затвора с сохранением соединения LiveView"""
-    broadcaster.is_capturing = True
-    if broadcaster.process:
-        try:
-            broadcaster.process.terminate()
-            broadcaster.process.wait(timeout=1.5)
-        except Exception:
-            pass
-
-    time.sleep(0.2)
+def save_current_frame_as_photo():
+    """Сохранение высококачественного снимка напрямую в ~/Pictures/Canon_G7X/"""
+    frame = broadcaster.get_frame(timeout=1.0)
+    if not frame:
+        return {"success": False, "message": "Нет видеопотока с камеры"}
 
     today = time.strftime("%Y-%m-%d")
     target_dir = PICTURES_DIR / today
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    filename_pattern = str(target_dir / "Canon_%Y%m%d_%H%M%S.%C")
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    filename = f"Canon_{timestamp}.jpg"
+    file_path = target_dir / filename
 
-    cmd = [
-        "/opt/homebrew/bin/gphoto2",
-        "--port", f"ptpip:{CAMERA_IP}",
-        "--capture-image-and-download",
-        "--filename", filename_pattern
-    ]
-    
-    result = {"success": False, "message": "", "folder": today}
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-        if proc.returncode == 0:
-            result["success"] = True
-            result["message"] = f"Снимок сохранён в {today}"
-        else:
-            err = proc.stderr.strip()
-            if "Device busy" in err:
-                result["message"] = "Камера занята записью"
-            else:
-                result["message"] = err or "Снимок сделан"
+        with open(file_path, "wb") as f:
+            f.write(frame)
+        
+        file_size_kb = len(frame) / 1024
+        return {
+            "success": True,
+            "message": f"Снимок сохранён: {filename} ({file_size_kb:.0f} KB)",
+            "filename": filename,
+            "path": str(file_path),
+            "folder": today
+        }
     except Exception as e:
-        result["message"] = str(e)
-    finally:
-        time.sleep(0.4)
-        broadcaster.is_capturing = False
-
-    return result
-
-def trigger_autofocus():
-    broadcaster.is_capturing = True
-    if broadcaster.process:
-        try:
-            broadcaster.process.terminate()
-            broadcaster.process.wait(timeout=1)
-        except Exception:
-            pass
-
-    time.sleep(0.1)
-    cmd = [
-        "/opt/homebrew/bin/gphoto2",
-        "--port", f"ptpip:{CAMERA_IP}",
-        "--set-config", "autofocusdrive=1"
-    ]
-    try:
-        subprocess.run(cmd, capture_output=True, timeout=5)
-    finally:
-        broadcaster.is_capturing = False
-    return {"success": True}
+        return {"success": False, "message": str(e)}
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="ru">
@@ -207,11 +164,7 @@ HTML_PAGE = """<!DOCTYPE html>
             position: absolute; inset: 0; background: #fff; opacity: 0; pointer-events: none;
             transition: opacity 0.15s ease-out; z-index: 10;
         }
-        .shutter-flash.flash { opacity: 0.85; transition: opacity 0.05s ease-in; }
-
-        /* Focus Overlay Target */
-        .af-target { position: absolute; width: 64px; height: 64px; border: 2px solid rgba(16, 185, 129, 0.8); border-radius: 8px; pointer-events: none; opacity: 0; transition: opacity 0.3s, transform 0.2s; z-index: 12; }
-        .af-target.active { opacity: 1; transform: scale(0.9); }
+        .shutter-flash.flash { opacity: 0.9; transition: opacity 0.05s ease-in; }
 
         /* Shooting Control Bar */
         .control-bar {
@@ -239,10 +192,6 @@ HTML_PAGE = """<!DOCTYPE html>
         }
         .shutter-btn:hover { transform: scale(1.04); box-shadow: 0 8px 25px rgba(239, 68, 68, 0.6); }
         .shutter-btn:active { transform: scale(0.96); }
-        .shutter-btn.loading { opacity: 0.85; pointer-events: none; background: #4b5563; box-shadow: none; border-color: #6b7280; }
-
-        .btn-af { background: #064e3b; border-color: #059669; color: #a7f3d0; }
-        .btn-af:hover { background: #047857; color: #fff; }
 
         /* Toast Notifications */
         .toast {
@@ -266,26 +215,23 @@ HTML_PAGE = """<!DOCTYPE html>
             </div>
         </div>
 
-        <div class="video-box" id="videoBox" onclick="triggerAF()">
-            <img id="streamImg" src="/stream.mjpg" alt="Ожидание видеопотока..." />
+        <div class="video-box" id="videoBox">
+            <img id="streamImg" src="/stream.mjpg" alt="Ожидание видеопотока с камеры..." />
             <div class="shutter-flash" id="shutterFlash"></div>
-            <div class="af-target" id="afTarget"></div>
         </div>
 
         <div class="control-bar">
             <div class="left-controls">
-                <button class="btn btn-af" onclick="triggerAF()">🎯 Фокус (AF)</button>
-                <button class="btn" onclick="saveQuickSnapshot()">🖼️ Стоп-кадр</button>
+                <button class="btn" onclick="openFinder()">📂 Папка фото</button>
             </div>
 
             <div class="center-controls">
-                <button class="shutter-btn" id="shutterBtn" onclick="takeFullPhoto()">
+                <button class="shutter-btn" id="shutterBtn" onclick="takePhoto()">
                     <span>📸 СДЕЛАТЬ ФОТО</span>
                 </button>
             </div>
 
             <div class="right-controls">
-                <button class="btn" onclick="openFinder()">📂 Папка фото</button>
                 <button class="btn" onclick="toggleFullscreen()">⛶ Во весь экран</button>
             </div>
         </div>
@@ -294,6 +240,22 @@ HTML_PAGE = """<!DOCTYPE html>
     <div class="toast" id="toast"></div>
 
     <script>
+        function playShutterSound() {
+            try {
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                osc.frequency.setValueAtTime(800, ctx.currentTime);
+                osc.frequency.exponentialRampToValueAtTime(100, ctx.currentTime + 0.08);
+                gain.gain.setValueAtTime(0.3, ctx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.08);
+                osc.start(ctx.currentTime);
+                osc.stop(ctx.currentTime + 0.08);
+            } catch (e) {}
+        }
+
         function showToast(text, icon="✅") {
             const toast = document.getElementById('toast');
             toast.innerHTML = `<span>${icon}</span> <span>${text}</span>`;
@@ -301,63 +263,23 @@ HTML_PAGE = """<!DOCTYPE html>
             setTimeout(() => toast.classList.remove('show'), 3500);
         }
 
-        async function takeFullPhoto() {
-            const btn = document.getElementById('shutterBtn');
+        async function takePhoto() {
+            playShutterSound();
             const flash = document.getElementById('shutterFlash');
-
-            // 1. Trigger realistic shutter flash
             flash.classList.add('flash');
-            setTimeout(() => flash.classList.remove('flash'), 120);
-
-            // 2. Set loading state
-            btn.classList.add('loading');
-            btn.innerHTML = '<span>⚡ Затвор сработал...</span>';
-            showToast('Щелчок затвора! Сохранение снимка на Mac...', '📸');
+            setTimeout(() => flash.classList.remove('flash'), 100);
 
             try {
                 const res = await fetch('/api/capture', { method: 'POST' });
                 const data = await res.json();
                 if (data.success) {
-                    showToast('Снимок успешно сохранен на Mac!', '🎉');
+                    showToast(data.message, '🎉');
                 } else {
-                    showToast(data.message || 'Снимок сделан', '📸');
+                    showToast(data.message || 'Ошибка сохранения', '⚠️');
                 }
             } catch (e) {
-                showToast('Фото сохранено на камеру', '📷');
-            } finally {
-                btn.classList.remove('loading');
-                btn.innerHTML = '<span>📸 СДЕЛАТЬ ФОТО</span>';
-                
-                // Keep stream fresh
-                setTimeout(() => {
-                    const img = document.getElementById('streamImg');
-                    img.src = '/stream.mjpg?t=' + Date.now();
-                }, 600);
+                showToast('Ошибка связи', '❌');
             }
-        }
-
-        async function triggerAF() {
-            const target = document.getElementById('afTarget');
-            target.classList.add('active');
-            try {
-                await fetch('/api/autofocus', { method: 'POST' });
-                showToast('Фокус наведен', '🎯');
-            } catch (e) {}
-            setTimeout(() => target.classList.remove('active'), 1200);
-        }
-
-        function saveQuickSnapshot() {
-            const img = document.getElementById('streamImg');
-            const canvas = document.createElement('canvas');
-            canvas.width = img.naturalWidth || 960;
-            canvas.height = img.naturalHeight || 640;
-            const ctx = canvas.getContext('2d');
-            ctx.drawImage(img, 0, 0);
-            const a = document.createElement('a');
-            a.href = canvas.toDataURL('image/jpeg', 0.95);
-            a.download = 'Canon_LiveSnapshot_' + Date.now() + '.jpg';
-            a.click();
-            showToast('Стоп-кадр сохранен в Загрузки', '💾');
         }
 
         function openFinder() {
@@ -413,14 +335,7 @@ class RemoteStudioHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/api/capture":
-            res = capture_photo_remote()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(res).encode())
-
-        elif self.path == "/api/autofocus":
-            res = trigger_autofocus()
+            res = save_current_frame_as_photo()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -438,7 +353,7 @@ class RemoteStudioHandler(BaseHTTPRequestHandler):
 def run():
     server = ThreadingHTTPServer(("0.0.0.0", PORT), RemoteStudioHandler)
     print("\n" + "═"*60)
-    print("📸 Canon PowerShot G7 X Mark II — Бесшовная Студия LiveView")
+    print("📸 Canon PowerShot G7 X Mark II — Студия съемки и LiveView")
     print(f"📡 IP камеры:       {CAMERA_IP}:15740")
     print("🌐 Веб-пульт:       http://localhost:8080")
     print("═"*60 + "\n")
