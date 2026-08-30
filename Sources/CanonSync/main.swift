@@ -70,14 +70,18 @@ struct SyncConfig: Sendable {
     }
 
     static func printUsage() {
+        let identity = DeviceIdentity.getOrCreate()
         print("""
         📸 CanonSync — Фоновый автоконнект и синхронизация фото с Canon G7 X (PTP-IP / Wi-Fi)
         
+        Идентификатор Mac (Постоянный GUID): \(identity.clientGUID.uuidString)
+        Имя устройства: \(identity.friendlyName)
+
         Использование:
           swift run CanonSync [опции]
 
         Режимы:
-          (по умолчанию)       Непрерывный автоконнект: ждет включения камеры и сам скачивает фото
+          (по умолчанию)       Непрерывный автоконнект с постоянным ключом сопряжения
           -s, --stream         Запустить видеотрансляцию (LiveView)
           -l, --list           Только показать список файлов на камере
           --install-service    Установить как фоновую системную службу macOS (автозапуск при входе)
@@ -113,7 +117,7 @@ enum Log {
     }
 }
 
-// MARK: - Safe IP Storage
+// MARK: - Safe Storage
 
 final class SafeResult: @unchecked Sendable {
     private let lock = NSLock()
@@ -277,12 +281,14 @@ final class ServiceManager {
 
 final class App: @unchecked Sendable {
     private let config: SyncConfig
+    private let identity: DeviceIdentity
     private var isSyncing = false
     private var timer: Timer?
     private var lastKnownIP: String? = "192.168.223.242"
 
     init(config: SyncConfig) {
         self.config = config
+        self.identity = DeviceIdentity.getOrCreate()
     }
 
     func run() {
@@ -298,6 +304,8 @@ final class App: @unchecked Sendable {
         }
 
         Log.info("📸 CanonSync: Автоконнект активен")
+        Log.info("🔑 Постоянный GUID Mac: \(identity.clientGUID.uuidString)")
+        Log.info("💻 Имя устройства: \(identity.friendlyName)")
         Log.info("Папка сохранения: \(config.destinationURL.path)")
         try? FileManager.default.createDirectory(at: config.destinationURL, withIntermediateDirectories: true)
 
@@ -306,7 +314,6 @@ final class App: @unchecked Sendable {
         }
 
         Log.info("🔍 Мониторинг сети... Включите Wi-Fi на камере Canon G7 X.")
-        Log.info("Как только камера появится в сети, начнется автоматическая синхронизация.")
         Log.info("Для выхода нажмите Ctrl+C\n")
 
         startAutoConnectLoop()
@@ -337,7 +344,7 @@ final class App: @unchecked Sendable {
 
         guard let ip = targetIP else { return }
 
-        Log.camera("Обнаружена камера на \(ip):15740! Запуск автоконнекта...")
+        Log.camera("Обнаружена камера на \(ip):15740! Отправка постоянного ключа сопряжения...")
         syncWithCamera(ip: ip)
     }
 
@@ -365,7 +372,20 @@ final class App: @unchecked Sendable {
 
     private func syncWithCamera(ip: String) {
         isSyncing = true
-        Log.info("Подключение к камере (\(ip))...")
+        Log.info("Подключение к камере (\(ip)) с постоянным GUID...")
+
+        let ptpSession = PTPIPSession(
+            host: ip,
+            port: 15740,
+            clientGUID: identity.clientGUID,
+            clientName: identity.friendlyName
+        )
+        
+        let connected = ptpSession.connectAndOpen()
+        if connected {
+            Log.success("✅ PTP-IP сессия с постоянным ключом успешно согласована!")
+            ptpSession.disconnect()
+        }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/gphoto2")
