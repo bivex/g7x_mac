@@ -18,6 +18,7 @@ struct SyncConfig: Sendable {
     var liveStream: Bool = false
     var installService: Bool = false
     var uninstallService: Bool = false
+    var verbose: Bool = false
 
     static func parse() -> SyncConfig {
         var config = SyncConfig()
@@ -40,6 +41,8 @@ struct SyncConfig: Sendable {
                 }
             case "-s", "--stream", "--live":
                 config.liveStream = true
+            case "-v", "--verbose", "--debug":
+                config.verbose = true
             case "--install-daemon", "--install-service":
                 config.installService = true
             case "--uninstall-daemon", "--uninstall-service":
@@ -90,6 +93,7 @@ struct SyncConfig: Sendable {
         Опции:
           -d, --dir <путь>     Папка для сохранения (по умолчанию: ~/Pictures/Canon_G7X)
           --ip <адрес>         Прямой IP камеры (например, --ip 192.168.223.242)
+          -v, --verbose        Подробный вывод и расширенные логи сбоев
           --no-date            Не разбивать файлы по подпапкам с датами (YYYY-MM-DD)
           --raw                Скачивать только RAW (.CR2, .CR3, .RAW)
           --jpg, --jpeg        Скачивать только JPEG (.JPG, .JPEG)
@@ -101,12 +105,42 @@ struct SyncConfig: Sendable {
 // MARK: - Logger & System Notifications
 
 enum Log {
+    static var failureLogURL: URL {
+        let pictures = FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask).first!
+        return pictures.appendingPathComponent("Canon_G7X/connection_failures.log")
+    }
+
     static func info(_ message: String) { print("ℹ️  \(message)") }
     static func success(_ message: String) { print("✅ \(message)") }
     static func warn(_ message: String) { print("⚠️  \(message)") }
     static func error(_ message: String) { print("❌ \(message)") }
     static func camera(_ message: String) { print("📷 \(message)") }
     static func stream(_ message: String) { print("🔴 \(message)") }
+
+    static func failure(stage: String, error: String, hint: String? = nil) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let timestamp = formatter.string(from: Date())
+
+        var logEntry = "[\(timestamp)] [FAILED] [\(stage)] \(error)"
+        if let hint = hint {
+            logEntry += " | Подсказка: \(hint)"
+        }
+
+        print("🚨 " + logEntry)
+
+        // Append to connection_failures.log
+        try? FileManager.default.createDirectory(at: failureLogURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let handle = try? FileHandle(forWritingTo: failureLogURL) {
+            handle.seekToEndOfFile()
+            if let data = (logEntry + "\n").data(using: .utf8) {
+                handle.write(data)
+            }
+            try? handle.close()
+        } else {
+            try? (logEntry + "\n").write(to: failureLogURL, atomically: true, encoding: .utf8)
+        }
+    }
 
     static func notify(title: String, body: String) {
         let script = "display notification \"\(body)\" with title \"\(title)\" sound name \"default\""
@@ -215,68 +249,6 @@ final class NetworkScanner: @unchecked Sendable {
     }
 }
 
-// MARK: - Daemon Service Installer
-
-final class ServiceManager {
-    static let serviceName = "com.canonsync.daemon"
-    static var plistURL: URL {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        return home.appendingPathComponent("Library/LaunchAgents/\(serviceName).plist")
-    }
-
-    static func install() {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let binPath = "/usr/local/bin/canonsync"
-
-        let plistContent = """
-        <?xml version="1.0" encoding="UTF-8"?>
-        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0">
-        <dict>
-            <key>Label</key>
-            <string>\(serviceName)</string>
-            <key>ProgramArguments</key>
-            <array>
-                <string>\(binPath)</string>
-            </array>
-            <key>RunAtLoad</key>
-            <true/>
-            <key>KeepAlive</key>
-            <true/>
-            <key>StandardOutPath</key>
-            <string>\(home.path)/Pictures/Canon_G7X/canonsync.log</string>
-            <key>StandardErrorPath</key>
-            <string>\(home.path)/Pictures/Canon_G7X/canonsync_err.log</string>
-        </dict>
-        </plist>
-        """
-
-        try? FileManager.default.createDirectory(at: plistURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? plistContent.write(to: plistURL, atomically: true, encoding: .utf8)
-
-        let loadProc = Process()
-        loadProc.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        loadProc.arguments = ["load", "-w", plistURL.path]
-        try? loadProc.run()
-        loadProc.waitUntilExit()
-
-        Log.success("🎉 Служба автоконнекта успешно установлена!")
-        Log.info("Файл конфигурации: \(plistURL.path)")
-        Log.info("CanonSync будет автоматически запускаться при входе в систему и выгружать фото.")
-    }
-
-    static func uninstall() {
-        let unloadProc = Process()
-        unloadProc.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        unloadProc.arguments = ["unload", plistURL.path]
-        try? unloadProc.run()
-        unloadProc.waitUntilExit()
-
-        try? FileManager.default.removeItem(at: plistURL)
-        Log.success("Служба автоконнекта отключена и удалена.")
-    }
-}
-
 // MARK: - Main Application
 
 final class App: @unchecked Sendable {
@@ -293,20 +265,12 @@ final class App: @unchecked Sendable {
 
     func run() {
         setbuf(stdout, nil)
-        
-        if config.installService {
-            ServiceManager.install()
-            exit(0)
-        }
-        if config.uninstallService {
-            ServiceManager.uninstall()
-            exit(0)
-        }
 
         Log.info("📸 CanonSync: Автоконнект активен")
         Log.info("🔑 Постоянный GUID Mac: \(identity.clientGUID.uuidString)")
         Log.info("💻 Имя устройства: \(identity.friendlyName)")
-        Log.info("Папка сохранения: \(config.destinationURL.path)")
+        Log.info("📁 Папка сохранения: \(config.destinationURL.path)")
+        Log.info("📝 Лог сбоев подключения: \(Log.failureLogURL.path)")
         try? FileManager.default.createDirectory(at: config.destinationURL, withIntermediateDirectories: true)
 
         if let directIP = config.manualIP {
@@ -344,7 +308,7 @@ final class App: @unchecked Sendable {
 
         guard let ip = targetIP else { return }
 
-        Log.camera("Обнаружена камера на \(ip):15740! Отправка постоянного ключа сопряжения...")
+        Log.camera("Обнаружена камера на \(ip):15740! Запуск сопряжения...")
         syncWithCamera(ip: ip)
     }
 
@@ -372,7 +336,7 @@ final class App: @unchecked Sendable {
 
     private func syncWithCamera(ip: String) {
         isSyncing = true
-        Log.info("Подключение к камере (\(ip)) с постоянным GUID...")
+        Log.info("Проверка PTP-IP рукопожатия с \(ip)...")
 
         let ptpSession = PTPIPSession(
             host: ip,
@@ -381,12 +345,33 @@ final class App: @unchecked Sendable {
             clientName: identity.friendlyName
         )
         
-        let connected = ptpSession.connectAndOpen()
-        if connected {
-            Log.success("✅ PTP-IP сессия с постоянным ключом успешно согласована!")
+        let diagResult = ptpSession.connectAndOpen()
+        switch diagResult {
+        case .success(let num, let name):
+            Log.success("✅ Согласовано с \(name) (Connection #\(num))!")
+            ptpSession.disconnect()
+        case .handshakeTimedOut(let stage, let hint):
+            Log.failure(stage: "PTP Handshake: \(stage)", error: "Таймаут ожидания ответа камеры", hint: hint)
+            ptpSession.disconnect()
+        case .handshakeRejected(let code, let desc):
+            Log.failure(stage: "PTP Authorization", error: "Отказ камеры (код \(String(format: "0x%08X", code)))", hint: desc)
+            ptpSession.disconnect()
+        case .socketConnectFailed(let err, let desc):
+            Log.failure(stage: "TCP Socket Connect", error: "Ошибка \(err): \(desc)", hint: "Проверьте стабильность Wi-Fi сигнала")
+            ptpSession.disconnect()
+        case .connectionResetByCamera(let stage):
+            Log.failure(stage: stage, error: "Камера разорвала соединение (Reset by peer)", hint: "Возможно, камера перешла в спящий режим")
+            ptpSession.disconnect()
+        case .eventSocketFailed(let err, let desc):
+            Log.failure(stage: "Event Socket", error: "Ошибка \(err): \(desc)")
+            ptpSession.disconnect()
+        case .protocolError(let desc):
+            Log.failure(stage: "Protocol", error: desc)
             ptpSession.disconnect()
         }
 
+        // Start file transfer
+        Log.info("Запуск загрузки файлов...")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/gphoto2")
         
@@ -431,10 +416,10 @@ final class App: @unchecked Sendable {
                 Log.success("Синхронизация успешно завершена!")
                 Log.notify(title: "Canon G7 X Sync", body: "Синхронизация завершена! Фото сохранены в ~/Pictures/Canon_G7X")
             } else {
-                Log.info("Ожидание подтверждения на камере или завершение сессии.")
+                Log.failure(stage: "gphoto2 transfer", error: "Код завершения: \(process.terminationStatus)", hint: "Камера закрыла сессию или ожидается выбор на экране")
             }
         } catch {
-            Log.error("Ошибка запуска: \(error.localizedDescription)")
+            Log.failure(stage: "Process launch", error: error.localizedDescription)
         }
 
         print(String(repeating: "─", count: 50) + "\n")
