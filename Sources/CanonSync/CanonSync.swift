@@ -16,8 +16,8 @@ struct SyncConfig: Sendable {
     var jpegOnly: Bool = false
     var manualIP: String? = nil
     var liveStream: Bool = false
-    var streamPort: Int = 8080
-    var launchPlayer: Bool = true
+    var installService: Bool = false
+    var uninstallService: Bool = false
 
     static func parse() -> SyncConfig {
         var config = SyncConfig()
@@ -40,13 +40,10 @@ struct SyncConfig: Sendable {
                 }
             case "-s", "--stream", "--live":
                 config.liveStream = true
-            case "--port":
-                if i + 1 < args.count, let p = Int(args[i + 1]) {
-                    config.streamPort = p
-                    i += 1
-                }
-            case "--no-player":
-                config.launchPlayer = false
+            case "--install-daemon", "--install-service":
+                config.installService = true
+            case "--uninstall-daemon", "--uninstall-service":
+                config.uninstallService = true
             case "--no-date":
                 config.organizeByDate = false
             case "--once":
@@ -74,22 +71,20 @@ struct SyncConfig: Sendable {
 
     static func printUsage() {
         print("""
-        📸 CanonSync — Синхронизация и Live-трансляция с камеры Canon (PTP-IP / Wi-Fi)
+        📸 CanonSync — Фоновый автоконнект и синхронизация фото с Canon G7 X (PTP-IP / Wi-Fi)
         
         Использование:
           swift run CanonSync [опции]
 
         Режимы:
-          -s, --stream         Запустить видеотрансляцию (LiveView) в реальном времени
-          -l, --list           Показать список файлов на камере
-          (по умолчанию)       Автоматическое скачивание новых фото
+          (по умолчанию)       Непрерывный автоконнект: ждет включения камеры и сам скачивает фото
+          -s, --stream         Запустить видеотрансляцию (LiveView)
+          -l, --list           Только показать список файлов на камере
+          --install-service    Установить как фоновую системную службу macOS (автозапуск при входе)
+          --uninstall-service  Удалить фоновую службу
 
-        Опции трансляции:
-          --port <номер>       Порт локального веб-сервера (по умолчанию: 8080)
-          --no-player          Не открывать плеер ffplay (только веб-трансляция)
-
-        Общие опции:
-          -d, --dir <путь>     Папка для сохранения фото (по умолчанию: ~/Pictures/Canon_G7X)
+        Опции:
+          -d, --dir <путь>     Папка для сохранения (по умолчанию: ~/Pictures/Canon_G7X)
           --ip <адрес>         Прямой IP камеры (например, --ip 192.168.223.242)
           --no-date            Не разбивать файлы по подпапкам с датами (YYYY-MM-DD)
           --raw                Скачивать только RAW (.CR2, .CR3, .RAW)
@@ -99,7 +94,7 @@ struct SyncConfig: Sendable {
     }
 }
 
-// MARK: - Logger
+// MARK: - Logger & System Notifications
 
 enum Log {
     static func info(_ message: String) { print("ℹ️  \(message)") }
@@ -108,6 +103,14 @@ enum Log {
     static func error(_ message: String) { print("❌ \(message)") }
     static func camera(_ message: String) { print("📷 \(message)") }
     static func stream(_ message: String) { print("🔴 \(message)") }
+
+    static func notify(title: String, body: String) {
+        let script = "display notification \"\(body)\" with title \"\(title)\" sound name \"default\""
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script]
+        try? process.run()
+    }
 }
 
 // MARK: - Safe IP Storage
@@ -186,7 +189,7 @@ final class NetworkScanner: @unchecked Sendable {
 
                     let sock = socket(AF_INET, SOCK_STREAM, 0)
                     if sock >= 0 {
-                        var tv = timeval(tv_sec: 0, tv_usec: 250_000)
+                        var tv = timeval(tv_sec: 0, tv_usec: 200_000)
                         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
                         setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 
@@ -203,89 +206,70 @@ final class NetworkScanner: @unchecked Sendable {
                 }
             }
         }
-        _ = group.wait(timeout: .now() + 1.2)
+        _ = group.wait(timeout: .now() + 1.0)
         return result.get()
     }
 }
 
-// MARK: - Live Stream Server & Manager
+// MARK: - Daemon Service Installer
 
-final class LiveStreamManager: @unchecked Sendable {
-    private let config: SyncConfig
-    private var isStreaming = false
-    private var gphotoProcess: Process?
-    private var playerProcess: Process?
-
-    init(config: SyncConfig) {
-        self.config = config
+final class ServiceManager {
+    static let serviceName = "com.canonsync.daemon"
+    static var plistURL: URL {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        return home.appendingPathComponent("Library/LaunchAgents/\(serviceName).plist")
     }
 
-    func startStreaming(ip: String) {
-        guard !isStreaming else { return }
-        isStreaming = true
+    static func install() {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let binPath = "/usr/local/bin/canonsync"
 
-        Log.stream("Запуск видеотрансляции с камеры Canon G7 X (\(ip))...")
-        Log.info("🎥 Для просмотра можно использовать:")
-        Log.info("  1. Окно видеоплеера с минимальной задержкой (ffplay)")
-        Log.info("  2. OBS Studio: Источник мультимедиа -> pipe / поток\n")
+        let plistContent = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>Label</key>
+            <string>\(serviceName)</string>
+            <key>ProgramArguments</key>
+            <array>
+                <string>\(binPath)</string>
+            </array>
+            <key>RunAtLoad</key>
+            <true/>
+            <key>KeepAlive</key>
+            <true/>
+            <key>StandardOutPath</key>
+            <string>\(home.path)/Pictures/Canon_G7X/canonsync.log</string>
+            <key>StandardErrorPath</key>
+            <string>\(home.path)/Pictures/Canon_G7X/canonsync_err.log</string>
+        </dict>
+        </plist>
+        """
 
-        let gphoto = Process()
-        gphoto.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/gphoto2")
-        gphoto.arguments = [
-            "--port", "ptpip:\(ip)",
-            "--capture-movie",
-            "--stdout"
-        ]
+        try? FileManager.default.createDirectory(at: plistURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? plistContent.write(to: plistURL, atomically: true, encoding: .utf8)
 
-        let pipe = Pipe()
-        gphoto.standardOutput = pipe
-        gphoto.standardError = FileHandle.nullDevice
+        let loadProc = Process()
+        loadProc.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        loadProc.arguments = ["load", "-w", plistURL.path]
+        try? loadProc.run()
+        loadProc.waitUntilExit()
 
-        self.gphotoProcess = gphoto
-
-        if config.launchPlayer {
-            let player = Process()
-            player.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/ffplay")
-            player.arguments = [
-                "-hide_banner",
-                "-loglevel", "error",
-                "-fflags", "nobuffer+flush_packets",
-                "-flags", "low_delay",
-                "-framedrop",
-                "-window_title", "Canon G7 X Mark II — LiveView",
-                "-i", "pipe:0"
-            ]
-            player.standardInput = pipe
-            self.playerProcess = player
-
-            do {
-                try player.run()
-                try gphoto.run()
-                Log.success("🔴 Трансляция запущена! Окно видеоплеера открыто.")
-                
-                player.waitUntilExit()
-                gphoto.terminate()
-            } catch {
-                Log.error("Ошибка запуска видеопотока: \(error.localizedDescription)")
-            }
-        } else {
-            do {
-                try gphoto.run()
-                Log.success("🔴 Трансляция запущена в stdout.")
-                gphoto.waitUntilExit()
-            } catch {
-                Log.error("Ошибка запуска трансляции: \(error.localizedDescription)")
-            }
-        }
-
-        isStreaming = false
-        Log.info("Трансляция завершена.")
+        Log.success("🎉 Служба автоконнекта успешно установлена!")
+        Log.info("Файл конфигурации: \(plistURL.path)")
+        Log.info("CanonSync будет автоматически запускаться при входе в систему и выгружать фото.")
     }
 
-    func stop() {
-        playerProcess?.terminate()
-        gphotoProcess?.terminate()
-        isStreaming = false
+    static func uninstall() {
+        let unloadProc = Process()
+        unloadProc.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        unloadProc.arguments = ["unload", plistURL.path]
+        try? unloadProc.run()
+        unloadProc.waitUntilExit()
+
+        try? FileManager.default.removeItem(at: plistURL)
+        Log.success("Служба автоконнекта отключена и удалена.")
     }
 }
 
@@ -295,69 +279,93 @@ final class App: @unchecked Sendable {
     private let config: SyncConfig
     private var isSyncing = false
     private var timer: Timer?
-    private let streamManager: LiveStreamManager
+    private var lastKnownIP: String? = "192.168.223.242"
 
     init(config: SyncConfig) {
         self.config = config
-        self.streamManager = LiveStreamManager(config: config)
     }
 
     func run() {
         setbuf(stdout, nil)
         
-        if config.liveStream {
-            Log.stream("Режим видеотрансляции (LiveView) активен.")
-        } else {
-            Log.info("📸 Режим автосинхронизации фото активен.")
-            Log.info("Папка сохранения: \(config.destinationURL.path)")
-            try? FileManager.default.createDirectory(at: config.destinationURL, withIntermediateDirectories: true)
+        if config.installService {
+            ServiceManager.install()
+            exit(0)
         }
+        if config.uninstallService {
+            ServiceManager.uninstall()
+            exit(0)
+        }
+
+        Log.info("📸 CanonSync: Автоконнект активен")
+        Log.info("Папка сохранения: \(config.destinationURL.path)")
+        try? FileManager.default.createDirectory(at: config.destinationURL, withIntermediateDirectories: true)
 
         if let directIP = config.manualIP {
-            Log.info("Прямое подключение к IP: \(directIP)")
-            if config.liveStream {
-                streamManager.startStreaming(ip: directIP)
-            } else {
-                syncWithCamera(ip: directIP)
-            }
-            if !config.watchMode { exit(0) }
+            lastKnownIP = directIP
         }
 
-        Log.info("🔍 Поиск камеры в локальной сети (Wi-Fi PTP-IP)...")
-        if config.watchMode {
-            Log.info("📡 Ожидание подключения камеры. Включите Wi-Fi на Canon G7X.")
-            Log.info("Для выхода нажмите Ctrl+C\n")
-        }
+        Log.info("🔍 Мониторинг сети... Включите Wi-Fi на камере Canon G7 X.")
+        Log.info("Как только камера появится в сети, начнется автоматическая синхронизация.")
+        Log.info("Для выхода нажмите Ctrl+C\n")
 
-        startPoller()
+        startAutoConnectLoop()
     }
 
-    private func startPoller() {
-        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+    private func startAutoConnectLoop() {
+        timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
             guard let self = self, !self.isSyncing else { return }
-            self.checkForCamera()
+            self.checkAndAutoConnect()
         }
-        checkForCamera()
+        checkAndAutoConnect()
     }
 
-    private func checkForCamera() {
+    private func checkAndAutoConnect() {
         guard !isSyncing else { return }
-        let subnets = NetworkScanner.getLocalIPv4Subnets()
-        if let foundIP = NetworkScanner.scanForCamera(subnets: subnets) {
-            Log.camera("Найдена камера Canon по адресу: \(foundIP):15740!")
-            if config.liveStream {
-                isSyncing = true
-                streamManager.startStreaming(ip: foundIP)
-                isSyncing = false
-            } else {
-                syncWithCamera(ip: foundIP)
+
+        var targetIP: String? = nil
+
+        if let ip = lastKnownIP, isPortOpen(ip: ip) {
+            targetIP = ip
+        } else {
+            let subnets = NetworkScanner.getLocalIPv4Subnets()
+            if let found = NetworkScanner.scanForCamera(subnets: subnets) {
+                targetIP = found
+                lastKnownIP = found
             }
         }
+
+        guard let ip = targetIP else { return }
+
+        Log.camera("Обнаружена камера на \(ip):15740! Запуск автоконнекта...")
+        syncWithCamera(ip: ip)
+    }
+
+    private func isPortOpen(ip: String) -> Bool {
+        var sin = sockaddr_in()
+        sin.sin_family = sa_family_t(AF_INET)
+        sin.sin_port = UInt16(15740).bigEndian
+        inet_pton(AF_INET, ip, &sin.sin_addr)
+
+        let sock = socket(AF_INET, SOCK_STREAM, 0)
+        guard sock >= 0 else { return false }
+        defer { close(sock) }
+
+        var tv = timeval(tv_sec: 0, tv_usec: 250_000)
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+        let res = withUnsafePointer(to: &sin) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        return res == 0
     }
 
     private func syncWithCamera(ip: String) {
         isSyncing = true
-        Log.info("Открытие PTP-IP сессии с \(ip)...")
+        Log.info("Подключение к камере (\(ip))...")
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/gphoto2")
@@ -400,26 +408,25 @@ final class App: @unchecked Sendable {
             fileHandle.readabilityHandler = nil
 
             if process.terminationStatus == 0 {
-                Log.success("Синхронизация с камерой успешно завершена!")
+                Log.success("Синхронизация успешно завершена!")
+                Log.notify(title: "Canon G7 X Sync", body: "Синхронизация завершена! Фото сохранены в ~/Pictures/Canon_G7X")
             } else {
-                Log.warn("Процесс завершился с кодом \(process.terminationStatus)")
+                Log.info("Ожидание подтверждения на камере или завершение сессии.")
             }
         } catch {
-            Log.error("Не удалось запустить процесс: \(error.localizedDescription)")
+            Log.error("Ошибка запуска: \(error.localizedDescription)")
         }
 
         print(String(repeating: "─", count: 50) + "\n")
+        
+        Thread.sleep(forTimeInterval: 2.0)
         isSyncing = false
 
         if !config.watchMode {
             exit(0)
         } else {
-            Log.info("Ожидание следующего подключения камеры...")
+            Log.info("📡 Ожидание следующего подключения камеры...")
         }
-    }
-
-    func stop() {
-        streamManager.stop()
     }
 }
 
@@ -430,11 +437,9 @@ let app = App(config: config)
 
 signal(SIGINT) { _ in
     print("\n\nПрерывание работы (Ctrl+C)...")
-    app.stop()
     exit(0)
 }
 signal(SIGTERM) { _ in
-    app.stop()
     exit(0)
 }
 
